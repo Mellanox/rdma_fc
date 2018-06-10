@@ -9,6 +9,7 @@
 #include <infiniband/verbs_exp.h>
 #include <rdma/rdma_cma.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/time.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -33,15 +34,14 @@ enum transport_type {
 };
 
 enum packet_type {
-    PACKET_SYN = 1,
     PACKET_FIN = 2
 };
 
 #define LOG(_level, _fmt, ...) \
     { \
         if (LOG_LEVEL_##_level <= g_options.log_level) { \
-            printf("%12s:%-4d " #_level "  " _fmt "\n", basename(__FILE__), \
-                   __LINE__, ## __VA_ARGS__); \
+            printf("%12s:%-4d %-5s " _fmt "\n", basename(__FILE__), \
+                   __LINE__, #_level, ## __VA_ARGS__); \
         } \
     }
 #define LOG_ERROR(_fmt, ...)   LOG(ERROR, _fmt, ## __VA_ARGS__)
@@ -54,7 +54,7 @@ enum packet_type {
                                 IBV_ACCESS_REMOTE_WRITE | \
                                 IBV_ACCESS_REMOTE_READ)
 #define IB_GRH_SIZE            40
-#define NUM_DCI                4
+#define NUM_DCI                8
 #define MIN(a, b)              ({ \
                                   typeof(a) _a = (a);  \
                                   typeof(b) _b = (b);  \
@@ -88,9 +88,6 @@ typedef struct {
     unsigned                  xport_timeout;
     unsigned                  rnr_retry;
     unsigned                  xport_retry_cnt;
-    unsigned                  traffic_class;
-    unsigned                  hop_limit;
-    unsigned                  gid_index;
 } options_t;
 
 /* Connection to remote peer (on either client or server) */
@@ -117,11 +114,12 @@ typedef struct {
     struct rdma_cm_id         *listen_cm_id;
     struct ibv_cq             *cq;
     struct ibv_srq            *srq;
-    unsigned                  grh_size;
     buffer_t                  recv_buf;
     buffer_t                  rdma_buf;
     struct ibv_exp_dct        *dct;
     struct ibv_qp             *dcis[NUM_DCI];
+    unsigned                  dci_outstanding[NUM_DCI];
+    uint64_t                  free_dci_bitmap;
     connection_t              *conns;
     unsigned                  num_conns;
     unsigned                  num_established;
@@ -134,7 +132,7 @@ typedef struct {
 /* Control packet */
 typedef struct {
     uint8_t                   type;        /* packet_type */
-    uint32_t                  conn_index;  /* index of connection to FIN/SYN */
+    uint32_t                  conn_index;  /* index of connection to FIN */
 } packet_t;
 
 /* Private data passed over rdma_cm protocol */
@@ -170,10 +168,7 @@ options_t g_options = {
     .min_rnr_timer         = 17,
     .xport_timeout         = 17,
     .rnr_retry             = 7,
-    .xport_retry_cnt       = 7,
-    .traffic_class         = 0,
-    .hop_limit             = 0,
-    .gid_index             = 0
+    .xport_retry_cnt       = 7
 };
 
 test_context_t g_test = {
@@ -206,9 +201,6 @@ static void usage(const options_t *defaults) {
     printf("                  possible values are:\n");
     printf("                    'rc' : Reliable Connection (RC) transport\n");
     printf("                    'dc' : Dynamic Connection (DC) transport\n");
-    printf("   -T <num>       Traffic class for DCT (%d)\n", defaults->traffic_class);
-    printf("   -H <num>       Hop limit for DCT (%d)\n", defaults->hop_limit);
-    printf("   -G <num>       GID index for DCT (%d)\n", defaults->gid_index);
     printf("   -v             Increase logging level\n");
     printf("\n");
     printf("Client options:\n");
@@ -225,7 +217,7 @@ static int parse_opts(int argc, char **argv) {
     options_t defaults = g_options;
     int c;
 
-    while ( (c = getopt(argc, argv, "hp:n:vt:x:i:r:o:T:H:G:")) != -1 ) {
+    while ( (c = getopt(argc, argv, "hp:n:vt:x:i:r:o:")) != -1 ) {
         switch (c) {
         case 'p':
             g_options.port_num = atoi(optarg);
@@ -258,15 +250,6 @@ static int parse_opts(int argc, char **argv) {
             break;
         case 'o':
             g_options.max_outstanding_reads = atol(optarg);
-            break;
-        case 'T':
-            g_options.traffic_class = atoi(optarg);
-            break;
-        case 'H':
-            g_options.hop_limit = atoi(optarg);
-            break;
-        case 'G':
-            g_options.gid_index = atoi(optarg);
             break;
         case 'h':
             usage(&defaults);
@@ -334,11 +317,6 @@ static int init_test()
         return -1;
     }
 
-    /* Set GRH size/offset for DC
-     * TODO make DCT scatter the GRH to receive buffer
-     */
-    g_test.grh_size = (g_options.transport == XPORT_RC) ? 0 : 0;/* TODO IB_GRH_SIZE */;
-
     return 0;
 }
 
@@ -400,18 +378,26 @@ static int get_address(struct sockaddr_in *in_addr)
     return 0;
 }
 
-static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
+static int init_dc_qps(struct rdma_cm_id *rdma_cm_id,
+                       const struct ibv_ah_attr *ah_attr)
 {
     struct ibv_exp_qp_init_attr qp_init_attr;
     struct ibv_exp_dct_init_attr dct_attr;
+    struct ibv_port_attr port_attr;
     struct ibv_exp_qp_attr qp_attr;
-    int i;
+    int i, ret;
 
     if (g_test.dct) {
         return 0; /* Already initialized */
     }
 
-    /* Create DCT
+    ret = ibv_query_port(rdma_cm_id->verbs, rdma_cm_id->port_num, &port_attr);
+    if (ret) {
+        LOG_ERROR("ibv_query_port() failed: %m");
+        return ret;
+    }
+
+   /* Create DCT
      * Note: For RoCE, must specify gid_index, hop_limit, traffic_class
      *       on command line.
      * */
@@ -421,12 +407,14 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
     dct_attr.srq           = g_test.srq;
     dct_attr.dc_key        = DC_KEY;
     dct_attr.port          = rdma_cm_id->port_num;
-    dct_attr.mtu           = IBV_MTU_1024; // TODO get port MTU
+    dct_attr.mtu           = port_attr.active_mtu;
     dct_attr.access_flags  = MEM_ACCESS_FLAGS;
     dct_attr.min_rnr_timer = g_options.min_rnr_timer;
-    dct_attr.tclass        = g_options.traffic_class;
-    dct_attr.hop_limit     = g_options.hop_limit;
-    dct_attr.gid_index     = g_options.gid_index;
+    if (ah_attr->is_global) {
+        dct_attr.tclass    = ah_attr->grh.traffic_class;
+        dct_attr.hop_limit = ah_attr->grh.hop_limit;
+        dct_attr.gid_index = ah_attr->grh.sgid_index;
+    }
 
     g_test.dct = ibv_exp_create_dct(rdma_cm_id->verbs, &dct_attr);
     if (!g_test.dct) {
@@ -434,7 +422,9 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
         return -1;
     }
 
-    LOG_DEBUG("Created DCT 0x%x", g_test.dct->dct_num);
+    LOG_DEBUG("Created DCT 0x%x tclass %d hlimit %d gid_index %d",
+              g_test.dct->dct_num, dct_attr.tclass, dct_attr.hop_limit,
+              dct_attr.gid_index);
 
     /* Create and initialize DC initiators */
     for (i = 0; i < NUM_DCI; ++i) {
@@ -458,7 +448,7 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
         }
 
         memset(&qp_attr, 0, sizeof(qp_attr));
-        qp_attr.path_mtu           = IBV_MTU_1024; // TODO port mtu
+        qp_attr.path_mtu           = port_attr.active_mtu;
         qp_attr.max_dest_rd_atomic = g_options.max_rd_atomic;
         qp_attr.min_rnr_timer      = g_options.min_rnr_timer;
         qp_attr.timeout            = g_options.xport_timeout;
@@ -466,7 +456,6 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
         qp_attr.retry_cnt          = g_options.xport_retry_cnt;
         qp_attr.max_rd_atomic      = g_options.max_rd_atomic;
         qp_attr.port_num           = rdma_cm_id->port_num;
-        qp_attr.pkey_index         = 0;
         qp_attr.qp_access_flags    = MEM_ACCESS_FLAGS;
         qp_attr.ah_attr.is_global  = 1;
         qp_attr.ah_attr.port_num   = rdma_cm_id->port_num;
@@ -507,8 +496,11 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
             return -1;
         }
 
+        g_test.dci_outstanding[i] = 0;
         LOG_DEBUG("Created DCI[%d]=0x%x", i, g_test.dcis[i]->qp_num);
     }
+
+    g_test.free_dci_bitmap = -1;
 
     return 0;
 }
@@ -521,20 +513,19 @@ static int post_receives()
     void *ptr;
     int ret;
 
-    /* We post receives only once, should have enough to handle 2 control
-     * message for every connection (SYN,FIN)
+    /* We post receives only once, should have enough to handle a control
+     * message for every connection (FIN)
      */
     for (i = 0; i < g_test.recv_available; ++i) {
         /* sge.addr points to grh, wr_id points after grh */
-        ptr        = g_test.recv_buf.ptr +
-                     i * (sizeof(packet_t) + g_test.grh_size);
+        ptr        = g_test.recv_buf.ptr + (i * sizeof(packet_t));
         wr.next    = NULL;
         wr.num_sge = 1;
         wr.sg_list = &sge;
         sge.addr   = (uintptr_t)ptr;
         sge.length = sizeof(packet_t);
         sge.lkey   = g_test.recv_buf.mr->lkey;
-        wr.wr_id   = (uintptr_t)ptr + g_test.grh_size;
+        wr.wr_id   = (uintptr_t)ptr;
 
         ret = ibv_post_srq_recv(g_test.srq, &wr, &bad_wr);
         if (ret) {
@@ -551,7 +542,7 @@ static int post_receives()
     return 0;
 }
 
-static int init_transport(struct rdma_cm_id *rdma_cm_id)
+static int init_transport(struct rdma_cm_event *event)
 {
     struct ibv_srq_init_attr srq_init_attr;
     struct ibv_qp_init_attr qp_init_attr;
@@ -559,11 +550,11 @@ static int init_transport(struct rdma_cm_id *rdma_cm_id)
 
     if (!g_test.cq) {
         /* Create single completion queue for both sends and receives */
-        g_test.cq = ibv_create_cq(rdma_cm_id->verbs,
-                                   g_options.tx_queue_len + g_options.rx_queue_len, /* cqe */
-                                   NULL, /* cq_context */
-                                   NULL, /* comp_channel */
-                                   0  /* comp_vector */ );
+        g_test.cq = ibv_create_cq(event->id->verbs,
+                                  g_options.tx_queue_len + g_options.rx_queue_len, /* cqe */
+                                  NULL, /* cq_context */
+                                  NULL, /* comp_channel */
+                                  0  /* comp_vector */ );
         if (!g_test.cq) {
             LOG_ERROR("ibv_create_cq() failed: %m");
             return -1;
@@ -578,7 +569,7 @@ static int init_transport(struct rdma_cm_id *rdma_cm_id)
         srq_init_attr.attr.max_wr    = g_options.rx_queue_len;
         srq_init_attr.attr.max_sge   = g_options.max_recv_sge;
         srq_init_attr.attr.srq_limit = 0;
-        g_test.srq = ibv_create_srq(rdma_cm_id->pd, &srq_init_attr);
+        g_test.srq = ibv_create_srq(event->id->pd, &srq_init_attr);
         if (!g_test.srq) {
             LOG_ERROR("ibv_create_srq() failed: %m");
             return -1;
@@ -590,14 +581,14 @@ static int init_transport(struct rdma_cm_id *rdma_cm_id)
     }
 
     /* Create buffer for receives */
-    ret = init_buffer(rdma_cm_id->pd, g_options.rx_queue_len * sizeof(packet_t),
+    ret = init_buffer(event->id->pd, g_options.rx_queue_len * sizeof(packet_t),
                       &g_test.recv_buf);
     if (ret) {
         return ret;
     }
 
     /* Create buffer for RDMA (one buffer which is split between connections) */
-    ret = init_buffer(rdma_cm_id->pd,
+    ret = init_buffer(event->id->pd,
                       g_options.num_connections * g_options.rdma_read_size,
                       &g_test.rdma_buf);
     if (ret) {
@@ -623,31 +614,22 @@ static int init_transport(struct rdma_cm_id *rdma_cm_id)
         qp_init_attr.cap.max_inline_data = 0;
         qp_init_attr.sq_sig_all          = 0;
 
-        ret = rdma_create_qp(rdma_cm_id, rdma_cm_id->pd, &qp_init_attr);
+        ret = rdma_create_qp(event->id, event->id->pd, &qp_init_attr);
         if (ret) {
             LOG_ERROR("rdma_create_qp() failed: %m");
             return ret;
         }
 
-        LOG_DEBUG("Created RC QP 0x%x", rdma_cm_id->qp->qp_num);
+        LOG_DEBUG("Created RC QP 0x%x", event->id->qp->qp_num);
     } else if (g_options.transport == XPORT_DC) {
         /* Initialize DC objects (done only once) */
-        ret = init_dc_qps(rdma_cm_id);
+        ret = init_dc_qps(event->id, &event->param.ud.ah_attr);
         if (ret) {
             return ret;
         }
     }
 
     return 0;
-}
-
-static connection_t* add_connection(struct rdma_cm_id *rdma_cm_id)
-{
-    connection_t *conn;
-
-    conn = &g_test.conns[g_test.num_conns++];
-    conn->rdma_id = rdma_cm_id;
-    return conn;
 }
 
 static void get_conn_param(struct rdma_conn_param *conn_param,
@@ -669,14 +651,42 @@ static void get_conn_param(struct rdma_conn_param *conn_param,
     conn_param->rnr_retry_count     = g_options.rnr_retry;
 }
 
-static void set_conn_param(const struct rdma_conn_param *conn_param,
-                           connection_t *conn)
+static int set_conn_param(connection_t *conn, struct rdma_cm_event *event)
 {
-    const conn_priv_t *remote_priv = conn_param->private_data;
+    const conn_priv_t *remote_priv = event->param.conn.private_data;
 
-    conn->remote_dctn = remote_priv->dct_num;
     conn->remote_addr = remote_priv->virt_addr;
     conn->rkey        = remote_priv->rkey;
+
+    if (g_options.transport == XPORT_DC) {
+        conn->dc_ah = ibv_create_ah(event->id->pd, &event->param.ud.ah_attr);
+        if (!conn->dc_ah) {
+            LOG_ERROR("ibv_create_ah() failed: %m");
+            return -1;
+        }
+
+        conn->remote_dctn = remote_priv->dct_num;
+        LOG_DEBUG("DC ah @%p remote_dctn 0x%x", conn->dc_ah, conn->remote_dctn);
+    }
+
+    return 0;
+}
+
+static connection_t* add_connection(struct rdma_cm_event *event)
+{
+    connection_t *conn;
+    int ret;
+
+    conn = &g_test.conns[g_test.num_conns];
+    conn->rdma_id = event->id;
+
+    ret = set_conn_param(conn, event);
+    if (ret) {
+        return NULL;
+    }
+
+    ++g_test.num_conns;
+    return conn;
 }
 
 static int handle_connect_request(struct rdma_cm_event *event)
@@ -686,7 +696,7 @@ static int handle_connect_request(struct rdma_cm_event *event)
     connection_t *conn;
     int ret;
 
-    ret = init_transport(event->id);
+    ret = init_transport(event);
     if (ret) {
         return ret;
     }
@@ -694,8 +704,12 @@ static int handle_connect_request(struct rdma_cm_event *event)
     /* add a new connection and set its parameters according to private_data
      * received from the client
      */
-    conn = add_connection(event->id);
-    set_conn_param(&event->param.conn, conn);
+    conn = add_connection(event);
+    if (!conn) {
+        return -1;
+    }
+
+    LOG_DEBUG("calling rdma_accept()");
 
     /* send accept message to the client with our own parameters in private_data */
     memset(&conn_param, 0, sizeof conn_param);
@@ -706,6 +720,11 @@ static int handle_connect_request(struct rdma_cm_event *event)
         return -1;
     }
 
+    if (g_options.transport == XPORT_DC) {
+        /* For DC server, the connection is ready after getting a connect request */
+        ++g_test.num_established;
+    }
+
     return 0;
 }
 
@@ -714,7 +733,7 @@ static int is_client()
     return strlen(g_options.dest_address);
 }
 
-/* send control message (SYN or FIN) */
+/* send control message */
 static int send_control(connection_t *conn, enum packet_type type,
                         unsigned conn_index)
 {
@@ -723,14 +742,18 @@ static int send_control(connection_t *conn, enum packet_type type,
     struct ibv_exp_send_wr exp_wr, *bad_exp_wr;
     struct ibv_send_wr wr, *bad_wr;
     struct ibv_sge sge;
-    int ret;
+    int dci, ret;
 
     sge.addr   = (uintptr_t)&packet;
     sge.length = sizeof(packet);
     sge.lkey   = 0;
 
     if (g_options.transport == XPORT_DC) {
+        dci = rand() % NUM_DCI;
+        assert(g_test.dci_outstanding[dci] < g_options.tx_queue_len);
+
         memset(&exp_wr, 0, sizeof(exp_wr));
+        exp_wr.wr_id             = dci;
         exp_wr.sg_list           = &sge;
         exp_wr.num_sge           = 1;
         exp_wr.exp_opcode        = IBV_EXP_WR_SEND;
@@ -739,11 +762,13 @@ static int send_control(connection_t *conn, enum packet_type type,
         exp_wr.dc.dct_access_key = DC_KEY;
         exp_wr.dc.dct_number     = conn->remote_dctn;
 
-        ret = ibv_exp_post_send(g_test.dcis[0], &exp_wr, &bad_exp_wr);
+        ret = ibv_exp_post_send(g_test.dcis[dci], &exp_wr, &bad_exp_wr);
         if (ret) {
             LOG_ERROR("ibv_exp_post_send() failed: %m");
             return -1;
         }
+
+        ++g_test.dci_outstanding[dci];
     } else if (g_options.transport == XPORT_RC) {
         memset(&wr, 0, sizeof(wr));
         wr.sg_list    = &sge;
@@ -764,31 +789,13 @@ static int send_control(connection_t *conn, enum packet_type type,
 
 static int handle_established(struct rdma_cm_event *event)
 {
-    const conn_priv_t *remote_priv;
     connection_t *conn;
-    int ret;
 
     if (is_client()) {
         /* Add new (and only) connection on client side */
-        conn = add_connection(event->id);
-        set_conn_param(&event->param.conn, conn);
-
-        /* For DC transport, client copies connection parameters and creates
-         * address handle
-         */
-        if (g_options.transport == XPORT_DC) {
-            conn->dc_ah = ibv_create_ah(event->id->pd, &event->param.ud.ah_attr);
-            if (!conn->dc_ah) {
-                LOG_ERROR("ibv_create_ah() failed: %m");
-                return -1;
-            }
-
-            LOG_DEBUG("DC ah @%p remote_dctn 0x%x", conn->dc_ah, conn->remote_dctn);
-            remote_priv = event->param.conn.private_data;
-            ret = send_control(conn, PACKET_SYN, remote_priv->conn_index);
-            if (ret) {
-                return ret;
-            }
+        conn = add_connection(event);
+        if (!conn) {
+            return -1;
         }
     }
 
@@ -811,7 +818,8 @@ static int wait_and_process_one_event(uint64_t event_mask) {
 
     if (!(BIT(event->event) & event_mask)) {
         LOG_ERROR("Unexpected event %s", rdma_event_str(event->event));
-        return -1;
+        ret = -1;
+        goto out_ack_event;
     }
 
     LOG_DEBUG("Got rdma_cm event %s", rdma_event_str(event->event));
@@ -820,15 +828,13 @@ static int wait_and_process_one_event(uint64_t event_mask) {
         ret = rdma_resolve_route(event->id, g_options.conn_timeout_ms);
         if (ret) {
             LOG_ERROR("rdma_resolve_route() failed: %m");
-            (void)rdma_ack_cm_event(event);
-            return -1;
+            goto out_ack_event;
         }
         break;
     case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        ret = init_transport(event->id);
+        ret = init_transport(event);
         if (ret) {
-            (void)rdma_ack_cm_event(event);
-            return ret;
+            goto out_ack_event;
         }
 
         memset(&conn_param, 0, sizeof conn_param);
@@ -844,13 +850,13 @@ static int wait_and_process_one_event(uint64_t event_mask) {
     case RDMA_CM_EVENT_CONNECT_REQUEST:
         ret = handle_connect_request(event);
         if (ret) {
-            return ret;
+            goto out_ack_event;
         }
         break;
     case RDMA_CM_EVENT_ESTABLISHED:
         ret = handle_established(event);
         if (ret) {
-            return ret;
+            goto out_ack_event;
         }
         break;
     case RDMA_CM_EVENT_DISCONNECTED:
@@ -867,6 +873,10 @@ static int wait_and_process_one_event(uint64_t event_mask) {
     }
 
     return 0;
+
+out_ack_event:
+    (void)rdma_ack_cm_event(event);
+    return ret;
 }
 
 static enum rdma_port_space get_port_space()
@@ -874,9 +884,19 @@ static enum rdma_port_space get_port_space()
     return (g_options.transport == XPORT_RC) ? RDMA_PS_TCP : RDMA_PS_UDP;
 }
 
+static void dc_send_completion(const struct ibv_wc* wc)
+{
+    int dci = wc->wr_id;
+
+    /* update outstanding sends counter and free dci bitmap */
+    assert(wc->qp_num == g_test.dcis[dci]->qp_num);
+    if (--g_test.dci_outstanding[dci] == 0) {
+        g_test.free_dci_bitmap |= BIT(dci);
+    }
+}
+
 static int poll_cq()
 {
-    connection_t *conn;
     packet_t *packet;
     struct ibv_wc wc;
     int ret;
@@ -898,22 +918,6 @@ static int poll_cq()
             LOG_TRACE("Received packet %d conn_index %d at %p", packet->type,
                       packet->conn_index, packet);
             switch (packet->type) {
-            case PACKET_SYN:
-                if (g_options.transport == XPORT_DC) {
-                    conn = &g_test.conns[packet->conn_index];
-                    conn->dc_ah = ibv_create_ah_from_wc(conn->rdma_id->pd, &wc,
-                                                        (void*)packet - IB_GRH_SIZE,
-                                                        conn->rdma_id->port_num);
-                    if (!conn->dc_ah) {
-                        LOG_ERROR("ibv_create_ah_from_wc() failed: %m");
-                        return -1;
-                    }
-
-                    LOG_DEBUG("Created AH @%p from WC on conn[%d]", conn->dc_ah,
-                              packet->conn_index);
-                    ++g_test.num_established;
-                }
-                break;
             case PACKET_FIN:
                 ++g_test.num_fin_recvd;
             default:
@@ -922,11 +926,18 @@ static int poll_cq()
             break;
         case IBV_WC_SEND:
             /* Outgoing send was acknowledged on transport level */
+            LOG_TRACE("SEND completion wr_id %ld", wc.wr_id);
+            if (g_options.transport == XPORT_DC) {
+                dc_send_completion(&wc);
+            }
             break;
         case IBV_WC_RDMA_READ:
             /* Outgoing RDMA_READ was completed */
-            LOG_TRACE("RDMA_READ completion on connection[%ld]", wc.wr_id);
+            LOG_TRACE("RDMA_READ completion wr_id %ld", wc.wr_id);
             --g_test.num_outstanding_reads;
+            if (g_options.transport == XPORT_DC) {
+                dc_send_completion(&wc);
+            }
             break;
         default:
             LOG_ERROR("Unexpected completion opcode %d", wc.opcode);
@@ -1029,23 +1040,30 @@ static int run_client()
     return 0;
 }
 
-static int post_rdma_read(connection_t *conn, size_t offset, size_t length)
+/* post rdma_read, set *posted to 1 if the operation was posted, 0 if no
+ * available QP is found
+ */
+static int post_rdma_read(connection_t *conn, size_t offset, size_t length,
+                          int *posted)
 {
-    struct ibv_send_wr wr, *bad_wr;
     struct ibv_sge sge;
+    uintptr_t remote_addr;
+    int dci;
 
-    sge.addr               = (uintptr_t)g_test.rdma_buf.ptr + offset;
-    sge.length             = length;
-    sge.lkey               = g_test.rdma_buf.mr->lkey;
+    remote_addr = conn->remote_addr + offset;
+    sge.addr    = (uintptr_t)g_test.rdma_buf.ptr + offset;
+    sge.length  = length;
+    sge.lkey    = g_test.rdma_buf.mr->lkey;
 
     if (g_options.transport == XPORT_RC) {
+        struct ibv_send_wr wr, *bad_wr;
+
         memset(&wr, 0, sizeof(wr));
-        wr.wr_id               = conn - g_test.conns;
         wr.sg_list             = &sge;
         wr.num_sge             = 1;
         wr.opcode              = IBV_WR_RDMA_READ;
         wr.send_flags          = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = conn->remote_addr + offset;
+        wr.wr.rdma.remote_addr = remote_addr;
         wr.wr.rdma.rkey        = conn->rkey;
 
         int ret = ibv_post_send(conn->rdma_id->qp, &wr, &bad_wr);
@@ -1054,16 +1072,60 @@ static int post_rdma_read(connection_t *conn, size_t offset, size_t length)
             return ret;
         }
 
-        /* Update counters */
-        ++g_test.num_outstanding_reads;
-        conn->read_offset += length;
+        *posted = 1;
 
         LOG_TRACE("RDMA_READ on QP 0x%x remote_address 0x%lx length %u into 0x%lx",
                   conn->rdma_id->qp->qp_num, wr.wr.rdma.remote_addr, sge.length,
                   sge.addr);
+    } else if (g_options.transport == XPORT_DC) {
+
+        struct ibv_exp_send_wr wr, *bad_wr;
+
+        if (!g_test.free_dci_bitmap) {
+            *posted = 0;
+            goto out;
+        }
+
+        /* find an available DCI */
+        dci = __builtin_ffsl(g_test.free_dci_bitmap) - 1;
+        assert(g_test.dci_outstanding[dci] == 0);
+
+        memset(&wr, 0, sizeof(wr));
+        wr.wr_id               = dci;
+        wr.sg_list             = &sge;
+        wr.num_sge             = 1;
+        wr.exp_opcode          = IBV_EXP_WR_RDMA_READ;
+        wr.exp_send_flags      = IBV_EXP_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.wr.rdma.rkey        = conn->rkey;
+        wr.dc.ah               = conn->dc_ah;
+        wr.dc.dct_number       = conn->remote_dctn;
+        wr.dc.dct_access_key   = DC_KEY;
+
+        int ret = ibv_exp_post_send(g_test.dcis[dci], &wr, &bad_wr);
+        if (ret) {
+            LOG_DEBUG("ibv_post_send() failed: %m");
+            return ret;
+        }
+
+        ++g_test.dci_outstanding[dci];
+        g_test.free_dci_bitmap &= ~BIT(dci);
+        *posted = 1;
+
+        LOG_TRACE("RDMA_READ on DCI[%d] 0x%x remote_address 0x%lx length %u into 0x%lx",
+                  dci, g_test.dcis[dci]->qp_num, wr.wr.rdma.remote_addr, sge.length,
+                  sge.addr);
+    } else {
+        *posted = 0;
     }
 
-    /* TODO support DC */
+    /* Update counters */
+    if (*posted) {
+        ++g_test.num_outstanding_reads;
+        conn->read_offset += length;
+    }
+
+out:
     return 0;
 }
 
@@ -1074,6 +1136,7 @@ static int do_rdma_reads()
     double sec_elapsed;
     unsigned i, iter;
     size_t size, bytes_transferred;
+    int posted;
     int ret;
     LIST_HEAD(sched);
 
@@ -1109,16 +1172,22 @@ static int do_rdma_reads()
                 assert(size > 0);
 
                 /* issue rdma read on the next segment */
-                ret = post_rdma_read(conn, conn->read_offset, size);
-                if (ret) {
+                posted = 0;
+                ret = post_rdma_read(conn, conn->read_offset, size, &posted);
+                if (ret < 0) {
                     return ret;
                 }
 
-                /* if this connection is not done, reinsert it to the tail of
-                 * the schedule queue
-                 */
-                if (conn->read_offset < g_options.rdma_read_size) {
-                    list_add_tail(&sched, &conn->list);
+                if (posted) {
+                    /* if this connection is not done, reinsert it to the tail of
+                     * the schedule queue
+                     */
+                    if (conn->read_offset < g_options.rdma_read_size) {
+                        list_add_tail(&sched, &conn->list);
+                    }
+                } else {
+                    /* If we could not sent, reinsert to the head of the queue */
+                    list_add_head(&sched, &conn->list);
                 }
             }
 
@@ -1129,6 +1198,11 @@ static int do_rdma_reads()
         }
     }
     gettimeofday(&tv_end, NULL);
+
+    /* make sure everything was read */
+    for (i = 0; i < g_test.num_conns; ++i) {
+        assert(g_test.conns[i].read_offset == g_options.rdma_read_size);
+    }
 
     /* Calculate and report total read bandwidth */
     sec_elapsed = (tv_end.tv_sec - tv_start.tv_sec) +
@@ -1179,32 +1253,14 @@ static int run_server()
 
     LOG_INFO("Waiting for %d connections...", g_options.num_connections);
     while (g_test.num_established < g_options.num_connections) {
-        if (g_options.transport == XPORT_RC) {
-            /* For RC, wait until all connections got ESTABLISHED event */
-            ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_CONNECT_REQUEST) |
-                                             BIT(RDMA_CM_EVENT_ESTABLISHED) |
-                                             BIT(RDMA_CM_EVENT_DISCONNECTED));
-            if (ret) {
-                return ret;
-            }
-        } else if (g_options.transport == XPORT_DC) {
-            /* For DC, wait until all connections got SYN packet. In meantime,
-             * need to also process CONNECT_REQUEST events
-             * TODO wait on CQ event / rdma event in parallel
-             */
-            if (g_test.num_conns < g_options.num_connections) {
-                ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_CONNECT_REQUEST));
-                if (ret) {
-                    return ret;
-                }
-            }
-
-            ret = poll_cq();
-            if (ret) {
-                return ret;
-            }
+        /* For RC, wait until all connections got ESTABLISHED event */
+        ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_CONNECT_REQUEST) |
+                                         BIT(RDMA_CM_EVENT_ESTABLISHED) |
+                                         BIT(RDMA_CM_EVENT_DISCONNECTED));
+        if (ret) {
+            return ret;
         }
-   }
+    }
 
     ret = do_rdma_reads();
     if (ret) {
