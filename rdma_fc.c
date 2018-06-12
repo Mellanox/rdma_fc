@@ -115,7 +115,6 @@ typedef struct {
 typedef struct {
     struct rdma_event_channel *event_ch;
     struct rdma_cm_id         *listen_cm_id;
-    struct rdma_cm_id         *client_cm_id;
     struct ibv_cq             *cq;
     struct ibv_srq            *srq;
     unsigned                  grh_size;
@@ -180,7 +179,6 @@ options_t g_options = {
 test_context_t g_test = {
     .event_ch        = NULL,
     .listen_cm_id    = NULL,
-    .client_cm_id    = NULL,
     .cq              = NULL,
     .srq             = NULL,
     .recv_buf = {
@@ -352,7 +350,7 @@ static void cleanup_test()
         if (g_test.conns[i].dc_ah) {
             ibv_destroy_ah(g_test.conns[i].dc_ah);
         }
-        if (g_test.conns[i].rdma_id != g_test.client_cm_id) {
+        if (g_test.conns[i].rdma_id != NULL) {
             rdma_destroy_id(g_test.conns[i].rdma_id);
         }
     }
@@ -369,9 +367,6 @@ static void cleanup_test()
     }
     cleanup_buffer(&g_test.rdma_buf);
     cleanup_buffer(&g_test.recv_buf);
-    if (g_test.client_cm_id) {
-        rdma_destroy_id(g_test.client_cm_id);
-    }
     if (g_test.listen_cm_id) {
         rdma_destroy_id(g_test.listen_cm_id);
     }
@@ -803,7 +798,9 @@ static int handle_established(struct rdma_cm_event *event)
 
 /* wait and process single event */
 static int wait_and_process_one_event(uint64_t event_mask) {
+    struct rdma_conn_param conn_param;
     struct rdma_cm_event *event;
+    conn_priv_t priv;
     int ret;
 
     ret = rdma_get_cm_event(g_test.event_ch, &event);
@@ -819,6 +816,31 @@ static int wait_and_process_one_event(uint64_t event_mask) {
 
     LOG_DEBUG("Got rdma_cm event %s", rdma_event_str(event->event));
     switch (event->event) {
+    case RDMA_CM_EVENT_ADDR_RESOLVED:
+        ret = rdma_resolve_route(event->id, g_options.conn_timeout_ms);
+        if (ret) {
+            LOG_ERROR("rdma_resolve_route() failed: %m");
+            (void)rdma_ack_cm_event(event);
+            return -1;
+        }
+        break;
+    case RDMA_CM_EVENT_ROUTE_RESOLVED:
+        ret = init_transport(event->id);
+        if (ret) {
+            (void)rdma_ack_cm_event(event);
+            return ret;
+        }
+
+        memset(&conn_param, 0, sizeof conn_param);
+        get_conn_param(&conn_param, &priv, 0);
+
+        ret = rdma_connect(event->id, &conn_param);
+        if (ret) {
+            LOG_ERROR("rdma_connect() failed: %m");
+            return -1;
+        }
+
+        break;
     case RDMA_CM_EVENT_CONNECT_REQUEST:
         ret = handle_connect_request(event);
         if (ret) {
@@ -963,67 +985,40 @@ static int disconnect()
 static int run_client()
 {
     struct sockaddr_in dest_addr;
-    struct rdma_conn_param conn_param;
-    conn_priv_t priv;
-    int ret;
-
-    g_options.num_connections = 1;
+    struct rdma_cm_id *rdma_id;
+    int i, ret;
 
     ret = get_address(&dest_addr);
     if (ret) {
         return ret;
     }
 
-    LOG_INFO("Connecting to %s...", g_options.dest_address);
+    for (i = 0; i < g_options.num_connections; ++i) {
 
-    ret = rdma_create_id(g_test.event_ch, &g_test.client_cm_id, NULL,
-                         get_port_space());
-    if (ret) {
-        LOG_ERROR("rdma_create_id() failed: %m");
-        return ret;
+        LOG_INFO("Connection[%d] to %s...", i, g_options.dest_address);
+
+        ret = rdma_create_id(g_test.event_ch, &rdma_id, NULL, get_port_space());
+        if (ret) {
+            LOG_ERROR("rdma_create_id() failed: %m");
+            return ret;
+        }
+
+        ret = rdma_resolve_addr(rdma_id, NULL, /* src_addr */
+                                (struct sockaddr *)&dest_addr,
+                                g_options.conn_timeout_ms);
+        if (ret) {
+            LOG_ERROR("rdma_resolve_addr() failed: %m");
+            return -1;
+        }
     }
 
-    ret = rdma_resolve_addr(g_test.client_cm_id, NULL, /* src_addr */
-                            (struct sockaddr *)&dest_addr,
-                            g_options.conn_timeout_ms);
-    if (ret) {
-        LOG_ERROR("rdma_resolve_addr() failed: %m");
-        return -1;
-    }
-
-    ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_ADDR_RESOLVED));
-    if (ret) {
-        return ret;
-    }
-
-    ret = rdma_resolve_route(g_test.client_cm_id, g_options.conn_timeout_ms);
-    if (ret) {
-        LOG_ERROR("rdma_resolve_route() failed: %m");
-        return -1;
-    }
-
-    ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_ROUTE_RESOLVED));
-    if (ret) {
-        return ret;
-    }
-
-    ret = init_transport(g_test.client_cm_id);
-    if (ret) {
-        return ret;
-    }
-
-    memset(&conn_param, 0, sizeof conn_param);
-    get_conn_param(&conn_param, &priv, 0);
-
-    ret = rdma_connect(g_test.client_cm_id, &conn_param);
-    if (ret) {
-        LOG_ERROR("rdma_connect() failed: %m");
-        return -1;
-    }
-
-    ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_ESTABLISHED));
-    if (ret) {
-        return ret;
+    while (g_test.num_established < g_options.num_connections) {
+        ret = wait_and_process_one_event(BIT(RDMA_CM_EVENT_ADDR_RESOLVED) |
+                                         BIT(RDMA_CM_EVENT_ROUTE_RESOLVED) |
+                                         BIT(RDMA_CM_EVENT_ESTABLISHED));
+        if (ret) {
+            return ret;
+        }
     }
 
     ret = disconnect();
