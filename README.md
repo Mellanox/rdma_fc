@@ -27,8 +27,33 @@ Flow control scheme:
 ./rdma_fc -n 1 <server-address>
 ```
 ---
-(1) DC support requires the following patches for librdmacm:
- - `librdmacm: copy ah_attr for ROUTE_RESOLVED event`
- - `IB/core: Set address handle attributes for UD ROUTE_RESOLVED event`
- - `IB/core: Set address handle attributes for UD CONNECT event`
+(1) DC transport in the test supports RoCE link only (not InfiniBand).
+    In addition, it may be needed to pass some of the following parameters to the test:
+
+<table>
+	<tr>
+		<td>Parameter</td>
+		<td>Description</td>
+		<td>ah_attr field</td>
+		<td>Default value</td>
+	</tr>
+	<tr>
+		<td>-G index</td>
+		<td>GID index to use. The full table can be shown  by "show_gids" command</td>
+		<td>grh.sgid_index</td>
+        <td>3 (usually means RoCEv2 with IPv4)</td>
+	</tr>
+	<tr>
+		<td>-T tclass</td>
+		<td>Ethernet DSCP</td>
+		<td>grh.traffic_class</td>
+		<td>0</td>
+	</tr>
+	<tr>
+		<td>-S sl</td>
+		<td>Ethernet priority</td>
+		<td>sl</td>
+		<td>0</td>
+	</tr>
+</table>
 

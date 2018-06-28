@@ -88,6 +88,10 @@ typedef struct {
     unsigned                  xport_timeout;
     unsigned                  rnr_retry;
     unsigned                  xport_retry_cnt;
+    uint8_t                   gid_index;
+    uint8_t                   hop_limit;
+    uint8_t                   traffic_class;
+    uint8_t                   sl;
 } options_t;
 
 /* Connection to remote peer (on either client or server) */
@@ -141,6 +145,7 @@ typedef struct {
     uint32_t                  dct_num;     /* DCT number (for DC only) */
     uint32_t                  rkey;        /* Remote key for RDMA */
     uint64_t                  virt_addr;   /* Remote buffer address for RDMA */
+    union ibv_gid             gid;         /* GID to use for sending packets */
 } conn_priv_t;
 
 static const char* transport_names[] = {
@@ -168,7 +173,11 @@ options_t g_options = {
     .min_rnr_timer         = 17,
     .xport_timeout         = 17,
     .rnr_retry             = 7,
-    .xport_retry_cnt       = 7
+    .xport_retry_cnt       = 7,
+    .gid_index             = 3,
+    .hop_limit             = 64,
+    .traffic_class         = 0,
+    .sl                    = 0
 };
 
 test_context_t g_test = {
@@ -202,6 +211,10 @@ static void usage(const options_t *defaults) {
     printf("                    'rc' : Reliable Connection (RC) transport\n");
     printf("                    'dc' : Dynamic Connection (DC) transport\n");
     printf("   -v             Increase logging level\n");
+    printf("   -G <index>     (DC only) GID index to use (%d)\n", defaults->gid_index);
+    printf("   -T <class>     (DC only) Traffic class / DSCP to use (%d)\n", defaults->traffic_class);
+    printf("   -H <limit>     (DC only) Hop limit / TTL (%d)\n", defaults->hop_limit);
+    printf("   -S <sl>        (DC only) SL / Ethernet priority (%d)\n", defaults->sl);
     printf("\n");
     printf("Client options:\n");
     printf("   -t <ms>        Connection timeout, milliseconds (%d)\n", defaults->conn_timeout_ms);
@@ -217,7 +230,7 @@ static int parse_opts(int argc, char **argv) {
     options_t defaults = g_options;
     int c;
 
-    while ( (c = getopt(argc, argv, "hp:n:vt:x:i:r:o:")) != -1 ) {
+    while ( (c = getopt(argc, argv, "hp:n:vt:x:i:r:o:G:T:H:S:")) != -1 ) {
         switch (c) {
         case 'p':
             g_options.port_num = atoi(optarg);
@@ -250,6 +263,18 @@ static int parse_opts(int argc, char **argv) {
             break;
         case 'o':
             g_options.max_outstanding_reads = atol(optarg);
+            break;
+        case 'G':
+            g_options.gid_index = atoi(optarg);
+            break;
+        case 'T':
+            g_options.traffic_class = atoi(optarg);
+            break;
+        case 'H':
+            g_options.hop_limit = atoi(optarg);
+            break;
+        case 'S':
+            g_options.sl = atoi(optarg);
             break;
         case 'h':
             usage(&defaults);
@@ -378,8 +403,7 @@ static int get_address(struct sockaddr_in *in_addr)
     return 0;
 }
 
-static int init_dc_qps(struct rdma_cm_id *rdma_cm_id,
-                       const struct ibv_ah_attr *ah_attr)
+static int init_dc_qps(struct rdma_cm_id *rdma_cm_id)
 {
     struct ibv_exp_qp_init_attr qp_init_attr;
     struct ibv_exp_dct_init_attr dct_attr;
@@ -397,6 +421,11 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id,
         return ret;
     }
 
+    if (port_attr.link_layer != IBV_LINK_LAYER_ETHERNET) {
+        LOG_ERROR("This test can run only on Ethernet (RoCE) port");
+        return -1;
+    }
+
    /* Create DCT
      * Note: For RoCE, must specify gid_index, hop_limit, traffic_class
      *       on command line.
@@ -410,11 +439,9 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id,
     dct_attr.mtu           = port_attr.active_mtu;
     dct_attr.access_flags  = MEM_ACCESS_FLAGS;
     dct_attr.min_rnr_timer = g_options.min_rnr_timer;
-    if (ah_attr->is_global) {
-        dct_attr.tclass    = ah_attr->grh.traffic_class;
-        dct_attr.hop_limit = ah_attr->grh.hop_limit;
-        dct_attr.gid_index = ah_attr->grh.sgid_index;
-    }
+    dct_attr.tclass        = g_options.traffic_class;
+    dct_attr.hop_limit     = g_options.hop_limit;
+    dct_attr.gid_index     = g_options.gid_index;
 
     g_test.dct = ibv_exp_create_dct(rdma_cm_id->verbs, &dct_attr);
     if (!g_test.dct) {
@@ -459,6 +486,7 @@ static int init_dc_qps(struct rdma_cm_id *rdma_cm_id,
         qp_attr.qp_access_flags    = MEM_ACCESS_FLAGS;
         qp_attr.ah_attr.is_global  = 1;
         qp_attr.ah_attr.port_num   = rdma_cm_id->port_num;
+        qp_attr.ah_attr.sl         = g_options.sl;
         qp_attr.rq_psn             = 0;
         qp_attr.sq_psn             = 0;
         qp_attr.dct_key            = DC_KEY;
@@ -623,7 +651,7 @@ static int init_transport(struct rdma_cm_event *event)
         LOG_DEBUG("Created RC QP 0x%x", event->id->qp->qp_num);
     } else if (g_options.transport == XPORT_DC) {
         /* Initialize DC objects (done only once) */
-        ret = init_dc_qps(event->id, &event->param.ud.ah_attr);
+        ret = init_dc_qps(event->id);
         if (ret) {
             return ret;
         }
@@ -632,15 +660,28 @@ static int init_transport(struct rdma_cm_event *event)
     return 0;
 }
 
-static void get_conn_param(struct rdma_conn_param *conn_param,
-                           conn_priv_t *priv, unsigned conn_index)
+static int get_conn_param(struct rdma_cm_id *rdma_id,
+                          struct rdma_conn_param *conn_param,
+                          conn_priv_t *priv, unsigned conn_index)
 {
+    int ret;
+
+    memset(conn_param, 0, sizeof(*conn_param));
+
     priv->conn_index          = conn_index;
     priv->rkey                = g_test.rdma_buf.mr->rkey;
     priv->virt_addr           = (uint64_t)g_test.rdma_buf.ptr +
                                 (conn_index * g_options.rdma_read_size);
     if (g_options.transport == XPORT_DC) {
         priv->dct_num         = g_test.dct->dct_num;
+
+        ret = ibv_query_gid(rdma_id->verbs, rdma_id->port_num,
+                            g_options.gid_index, &priv->gid);
+        if (ret) {
+            LOG_ERROR("ibv_query_gid(port=%d index=%d) failed: %m",
+                      rdma_id->port_num, g_options.gid_index);
+            return ret;
+        }
     }
 
     conn_param->private_data        = priv;
@@ -649,19 +690,32 @@ static void get_conn_param(struct rdma_conn_param *conn_param,
     conn_param->initiator_depth     = g_options.max_rd_atomic;
     conn_param->retry_count         = g_options.xport_retry_cnt;
     conn_param->rnr_retry_count     = g_options.rnr_retry;
+
+    return 0;
 }
 
 static int set_conn_param(connection_t *conn, struct rdma_cm_event *event)
 {
     const conn_priv_t *remote_priv = event->param.conn.private_data;
+    struct ibv_ah_attr ah_attr;
 
     conn->remote_addr = remote_priv->virt_addr;
     conn->rkey        = remote_priv->rkey;
 
     if (g_options.transport == XPORT_DC) {
-        conn->dc_ah = ibv_create_ah(event->id->pd, &event->param.ud.ah_attr);
+        memset(&ah_attr, 0, sizeof(ah_attr));
+
+        ah_attr.is_global         = 1;
+        ah_attr.port_num          = event->id->port_num;
+        ah_attr.sl                = g_options.sl;
+        ah_attr.grh.dgid          = remote_priv->gid;
+        ah_attr.grh.sgid_index    = g_options.gid_index;
+        ah_attr.grh.hop_limit     = g_options.hop_limit;
+        ah_attr.grh.traffic_class = g_options.traffic_class;
+
+        conn->dc_ah = ibv_create_ah(event->id->pd, &ah_attr);
         if (!conn->dc_ah) {
-            LOG_ERROR("ibv_create_ah() failed: %m");
+            LOG_ERROR("ibv_create_ah(port_num=%d) failed: %m", ah_attr.port_num );
             return -1;
         }
 
@@ -711,9 +765,12 @@ static int handle_connect_request(struct rdma_cm_event *event)
 
     LOG_DEBUG("calling rdma_accept()");
 
+    ret = get_conn_param(event->id, &conn_param, &priv, conn - g_test.conns);
+    if (ret) {
+        return ret;
+    }
+
     /* send accept message to the client with our own parameters in private_data */
-    memset(&conn_param, 0, sizeof conn_param);
-    get_conn_param(&conn_param, &priv, conn - g_test.conns);
     ret = rdma_accept(event->id, &conn_param);
     if (ret) {
         LOG_ERROR("rdma_accept() failed: %m");
@@ -837,8 +894,10 @@ static int wait_and_process_one_event(uint64_t event_mask) {
             goto out_ack_event;
         }
 
-        memset(&conn_param, 0, sizeof conn_param);
-        get_conn_param(&conn_param, &priv, 0);
+        ret = get_conn_param(event->id, &conn_param, &priv, 0);
+        if (ret) {
+            return ret;
+        }
 
         ret = rdma_connect(event->id, &conn_param);
         if (ret) {
